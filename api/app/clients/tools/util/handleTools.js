@@ -69,6 +69,11 @@ const {
 const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
 const { createOpenIDSessionTokenProvider } = require('~/server/services/OpenIDSessionRefresh');
 const { createFileSearchTool, primeFiles: primeSearchFiles } = require('./fileSearch');
+// The file_search tool must be created at most once per request: its factory
+// carries per-message state (the attachment ordinal used to renumber citation
+// anchors, see fileSearch.js). loadTools runs per agent-graph step and
+// re-invokes tool factories, so memoize by request to keep that state stable.
+const fileSearchToolCache = new WeakMap();
 const { primeFiles: primeCodeFiles } = require('~/server/services/Files/Code/process');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { getMCPServerTools, checkCapability } = require('~/server/services/Config');
@@ -366,6 +371,9 @@ const loadTools = async ({
       continue;
     } else if (tool === Tools.file_search) {
       requestedTools[tool] = async () => {
+        if (options.req && fileSearchToolCache.has(options.req)) {
+          return fileSearchToolCache.get(options.req);
+        }
         const { files, toolContext } = await primeSearchFiles({
           ...options,
           agentId: agent?.id,
@@ -390,13 +398,17 @@ const loadTools = async ({
           }
         }
 
-        return createFileSearchTool({
+        const createdTool = await createFileSearchTool({
           appConfig: options.req.config,
           userId: user,
           files,
           entity_id: agent?.id,
           fileCitations,
         });
+        if (options.req) {
+          fileSearchToolCache.set(options.req, createdTool);
+        }
+        return createdTool;
       };
       continue;
     } else if (tool === Tools.web_search) {
