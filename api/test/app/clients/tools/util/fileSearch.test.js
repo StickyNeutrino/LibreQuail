@@ -415,3 +415,74 @@ describe('entity_id scoping by file origin', () => {
     expect(bodiesSent()[0].entity_id).toBeUndefined();
   });
 });
+
+describe('fileSearch.js - citation anchor ordinals', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.RAG_API_URL = 'http://localhost:8000';
+    generateShortLivedToken.mockReturnValue('mock-jwt-token');
+  });
+
+  const mockQueryResponse = () => {
+    axios.post.mockImplementation(async (_url, body) => ({
+      data: [
+        [
+          {
+            page_content: body.file_id === 'file-1' ? 'alpha file passage' : 'beta file passage',
+            metadata: {
+              source: body.file_id === 'file-1' ? 'uploads/alpha.pdf' : 'uploads/beta.pdf',
+            },
+          },
+          0.1,
+        ],
+      ],
+    }));
+  };
+
+  const twoFiles = [
+    { file_id: 'file-1', filename: 'alpha.pdf', fromAgent: true },
+    { file_id: 'file-2', filename: 'beta.pdf', fromAgent: true },
+  ];
+
+  it('numbers anchors by result-set ordinal across multiple calls in one turn', async () => {
+    mockQueryResponse();
+    const fileSearchTool = await createFileSearchTool({
+      userId: 'user1',
+      fileCitations: true,
+      files: twoFiles,
+    });
+
+    const [firstContent, firstArtifact] = await fileSearchTool.func({ query: 'first query' });
+    expect(firstArtifact.file_search.sources).toHaveLength(2);
+    expect(firstContent).toContain('\\ue202turn0file0');
+    expect(firstContent).toContain('\\ue202turn0file1');
+    expect(firstContent).not.toContain('\\ue202turn1file');
+
+    const [secondContent, secondArtifact] = await fileSearchTool.func({ query: 'second query' });
+    expect(secondArtifact.file_search.sources).toHaveLength(2);
+    expect(secondContent).toContain('\\ue202turn1file0');
+    expect(secondContent).toContain('\\ue202turn1file1');
+    expect(secondContent).not.toContain('\\ue202turn0file');
+  });
+
+  it('does not advance the ordinal for a call that produces no sources', async () => {
+    mockQueryResponse();
+    // Each file_search call fires one POST per file — fail all of them so the
+    // tool call produces no sources (and no citation attachment).
+    axios.post.mockRejectedValueOnce(new Error('API Error'));
+    axios.post.mockRejectedValueOnce(new Error('API Error'));
+    const fileSearchTool = await createFileSearchTool({
+      userId: 'user1',
+      fileCitations: true,
+      files: twoFiles,
+    });
+
+    const [failedContent, failedArtifact] = await fileSearchTool.func({ query: 'failing query' });
+    expect(failedArtifact).toBeUndefined();
+    expect(failedContent).toBe('No results found or errors occurred while searching the files.');
+
+    const [nextContent] = await fileSearchTool.func({ query: 'next query' });
+    expect(nextContent).toContain('\\ue202turn0file0');
+    expect(nextContent).not.toContain('\\ue202turn1file');
+  });
+});

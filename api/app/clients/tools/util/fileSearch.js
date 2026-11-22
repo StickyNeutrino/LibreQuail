@@ -101,6 +101,12 @@ const createFileSearchTool = async ({
   fileCitations = false,
   appConfig,
 }) => {
+  // One tool instance is created per message, so this closure counter tracks how
+  // many file_search calls in the current turn produced a citation attachment.
+  // A call that returns no sources creates no attachment (processFileCitations
+  // returns null), so the counter only advances when an attachment is created,
+  // staying in lockstep with the client's attachment ordinal for file citations.
+  let attachmentOrdinal = 0;
   return tool(
     ({ query }) =>
       executeFileSearchQuery({
@@ -116,6 +122,26 @@ const createFileSearchTool = async ({
         logAxiosError,
         selectFileCitationSources,
         logger,
+      }).then((result) => {
+        // The anchor format hardcodes turn0 per call while the client indexes
+        // file-citation attachments by ordinal: with multiple file_search calls
+        // in one turn, every call's anchors resolve into the first call's
+        // sources and citations open the wrong document. Renumber this call's
+        // anchors to its attachment ordinal.
+        try {
+          let [content, artifact] = result;
+          const sources = artifact?.[Tools.file_search]?.sources;
+          if (typeof content === 'string' && Array.isArray(sources) && sources.length > 0) {
+            const ordinal = attachmentOrdinal++;
+            if (ordinal > 0 && content.includes('\\ue202turn0file')) {
+              content = content.replaceAll('\\ue202turn0file', `\\ue202turn${ordinal}file`);
+            }
+          }
+          return [content, artifact];
+        } catch (err) {
+          logger.error('[fileSearch] Failed to renumber citation anchors', err);
+          return result;
+        }
       }),
     {
       name: Tools.file_search,
@@ -130,7 +156,7 @@ Use the EXACT anchor markers shown below (copy them verbatim) immediately after 
 - Page reference: "According to report.docx... \\ue202turn0file1"
 - Multi-file: "Multiple sources confirm... \\ue200\\ue202turn0file0\\ue202turn0file1\\ue201"
 
-**CRITICAL:** Output these escape sequences EXACTLY as shown (e.g., \\ue202turn0file0). Do NOT substitute with other characters like † or similar symbols.
+**CRITICAL:** Output these escape sequences EXACTLY as shown (e.g., \\ue202turn0file0). Do NOT substitute with other characters like † or similar symbols. When a search result shows an anchor with a turn number other than 0 (e.g., \\ue202turn2file5), copy that one verbatim instead.
 **ALWAYS mention the filename in your text before the citation marker. NEVER use markdown links or footnotes.**`
           : ''
       }`,
