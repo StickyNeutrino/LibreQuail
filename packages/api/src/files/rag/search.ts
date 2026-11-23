@@ -23,7 +23,7 @@ type FileSearchSource = {
 
 interface SearchHit {
   page_content: string;
-  metadata: { source: string; page?: number | string | null };
+  metadata: { source: string; page?: number | string | null; file_id?: string };
 }
 
 type SearchResults = [SearchHit, number][];
@@ -45,6 +45,15 @@ interface SearchOptions {
   selectFileCitationSources: typeof selectFileCitationSources;
   logger: Pick<typeof logger, 'debug'>;
 }
+
+/** How many chunks one namespace-wide query returns. The tool call keeps the top 10
+ * chunks overall, and a single scoped query returns that set directly: the old
+ * per-file fan-out (5 per file, merged) picked the same chunks at one request
+ * per knowledge-base file. */
+const NAMESPACE_QUERY_K = 10;
+
+/** One search hit with the file it came from, ready for ranking. */
+type RankedHit = { hit: SearchHit; distance: number; file_id: string };
 
 /** Executes a file-search tool call without sending malformed queries to RAG API. */
 export async function executeFileSearchQuery({
@@ -72,65 +81,108 @@ export async function executeFileSearchQuery({
     return ['There was an error authenticating the file search request.', undefined];
   }
 
-  const createQueryBody = (file: SearchFile) => {
-    const body: { file_id: string; query: string; k: number; entity_id?: string } = {
-      file_id: file.file_id,
-      query,
-      k: 5,
-    };
-    // Only agent knowledge-base files carry entity_id. User attachments must stay user-scoped.
-    if (!entity_id || file.fromAgent !== true) {
-      return body;
-    }
-    body.entity_id = entity_id;
-    logger.debug(`[${Tools.file_search}] RAG API /query body`, body);
-    return body;
+  const headers = {
+    Authorization: `Bearer ${jwtToken}`,
+    'Content-Type': 'application/json',
   };
-
   const timeout = getOutboundTimeoutMs(appConfig, 'ragMs');
-  const queryPromises = files.map((file) =>
-    httpClient
-      .post<SearchResults>(`${ragApiUrl}/query`, createQueryBody(file), {
-        headers: {
-          Authorization: `Bearer ${jwtToken}`,
-          'Content-Type': 'application/json',
-        },
-        ...outboundRequestBudget(timeout, 'ragMs'),
-      })
-      .then((result) => ({ data: result.data, file_id: file.file_id }))
-      .catch((error) => {
-        logAxiosError({
-          message: 'Error encountered in `file_search` while querying file',
-          error,
-        });
-        return null;
-      }),
-  );
 
-  const results = await Promise.all(queryPromises);
-  const validResults = results.filter((result) => result !== null);
+  // Agent knowledge-base files all live in one namespace under `entity_id`, so one
+  // scoped query replaces a request per file. User attachments keep their per-file
+  // queries: they carry no shared namespace to search across and must stay user-scoped.
+  const namespaceFileIds =
+    entity_id == null
+      ? []
+      : [...new Set(files.filter((file) => file.fromAgent === true).map((file) => file.file_id))];
 
-  if (validResults.length === 0) {
+  /** One entry per issued request: its ranked hits, or null when the request failed. */
+  const requests: Array<Promise<RankedHit[] | null>> = [];
+
+  if (namespaceFileIds.length > 0) {
+    logger.debug(
+      `[${Tools.file_search}] RAG API /query_multiple: ${namespaceFileIds.length} file(s), k=${NAMESPACE_QUERY_K}, entity_id=${entity_id}`,
+    );
+    requests.push(
+      httpClient
+        .post<SearchResults>(
+          `${ragApiUrl}/query_multiple`,
+          { query, file_ids: namespaceFileIds, k: NAMESPACE_QUERY_K, entity_id },
+          { headers, ...outboundRequestBudget(timeout, 'ragMs') },
+        )
+        .then((result) =>
+          result.data
+            .map(([hit, distance]) => ({ hit, distance, file_id: hit.metadata.file_id }))
+            .filter((entry): entry is RankedHit => typeof entry.file_id === 'string'),
+        )
+        .catch((error) => {
+          // /query_multiple answers 404 when the scope matched no chunks; that is an
+          // empty result, not a failed search.
+          const status = (error as { response?: { status?: number } } | null)?.response?.status;
+          if (status === 404) {
+            return [];
+          }
+          logAxiosError({
+            message: 'Error encountered in `file_search` while querying the agent knowledge base',
+            error,
+          });
+          return null;
+        }),
+    );
+  }
+
+  for (const file of files) {
+    if (entity_id != null && file.fromAgent === true) {
+      continue; // already covered by the namespace query
+    }
+    requests.push(
+      httpClient
+        .post<SearchResults>(
+          `${ragApiUrl}/query`,
+          { file_id: file.file_id, query, k: 5 },
+          { headers, ...outboundRequestBudget(timeout, 'ragMs') },
+        )
+        .then((result) =>
+          result.data.map(
+            ([hit, distance]): RankedHit => ({
+              hit,
+              distance,
+              file_id: file.file_id,
+            }),
+          ),
+        )
+        .catch((error) => {
+          logAxiosError({
+            message: 'Error encountered in `file_search` while querying file',
+            error,
+          });
+          return null;
+        }),
+    );
+  }
+
+  const outcomes = await Promise.all(requests);
+  const succeeded = outcomes.filter((outcome): outcome is RankedHit[] => outcome !== null);
+
+  if (succeeded.length === 0) {
     return ['No results found or errors occurred while searching the files.', undefined];
   }
 
-  const formattedResults = validResults
-    .flatMap((result) =>
-      result.data.map(([docInfo, distance]) => ({
-        filename: docInfo.metadata.source.split('/').pop(),
-        content: docInfo.page_content,
-        distance,
-        file_id: result.file_id,
-        page:
-          typeof docInfo.metadata.page === 'number' &&
-          Number.isInteger(docInfo.metadata.page) &&
-          docInfo.metadata.page >= 0
-            ? docInfo.metadata.page + 1
-            : null,
-      })),
-    )
+  const formattedResults = succeeded
+    .flat()
     .sort((a, b) => a.distance - b.distance)
-    .slice(0, 10);
+    .slice(0, 10)
+    .map((entry) => ({
+      filename: entry.hit.metadata.source.split('/').pop(),
+      content: entry.hit.page_content,
+      distance: entry.distance,
+      file_id: entry.file_id,
+      page:
+        typeof entry.hit.metadata.page === 'number' &&
+        Number.isInteger(entry.hit.metadata.page) &&
+        entry.hit.metadata.page >= 0
+          ? entry.hit.metadata.page + 1
+          : null,
+    }));
 
   if (formattedResults.length === 0) {
     return [

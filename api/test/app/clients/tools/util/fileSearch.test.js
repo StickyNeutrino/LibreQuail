@@ -380,20 +380,43 @@ describe('entity_id scoping by file origin', () => {
       .map(([, body]) => body);
   }
 
-  it('sends entity_id only for agent knowledge-base files', async () => {
+  function batchBodiesSent() {
+    return axios.post.mock.calls
+      .filter(([url]) => String(url).endsWith('/query_multiple'))
+      .map(([, body]) => body);
+  }
+
+  it('searches agent knowledge-base files as one namespace query', async () => {
     const tool = await createFileSearchTool({
       userId: 'user1',
       entity_id: 'agent_123',
       files: [
         { file_id: 'kb-1', filename: 'kb.pdf', fromAgent: true },
+        { file_id: 'kb-2', filename: 'kb2.pdf', fromAgent: true },
         { file_id: 'user-1', filename: 'attachment.txt', fromAgent: false },
       ],
     });
     await tool.func({ query: 'q' });
 
-    const bodies = bodiesSent();
-    expect(bodies.find((b) => b.file_id === 'kb-1').entity_id).toBe('agent_123');
-    expect(bodies.find((b) => b.file_id === 'user-1').entity_id).toBeUndefined();
+    // The agent's files share one namespace, so one scoped request covers them all;
+    // the user attachment is not part of that namespace and keeps its own request.
+    expect(batchBodiesSent()).toEqual([
+      { query: 'q', file_ids: ['kb-1', 'kb-2'], k: 10, entity_id: 'agent_123' },
+    ]);
+    expect(bodiesSent()).toEqual([{ file_id: 'user-1', query: 'q', k: 5 }]);
+  });
+
+  it('keeps the per-file fan-out when there is no namespace', async () => {
+    const tool = await createFileSearchTool({
+      userId: 'user1',
+      files: [
+        { file_id: 'kb-1', filename: 'kb.pdf', fromAgent: true },
+        { file_id: 'kb-2', filename: 'kb2.pdf', fromAgent: true },
+      ],
+    });
+    await tool.func({ query: 'q' });
+    expect(batchBodiesSent()).toEqual([]);
+    expect(bodiesSent()).toHaveLength(2);
   });
 
   it('omits entity_id when fromAgent is not set (safe default)', async () => {
@@ -403,6 +426,7 @@ describe('entity_id scoping by file origin', () => {
       files: [{ file_id: 'legacy-1', filename: 'legacy.pdf' }],
     });
     await tool.func({ query: 'q' });
+    expect(batchBodiesSent()).toEqual([]);
     expect(bodiesSent()[0].entity_id).toBeUndefined();
   });
 
@@ -412,7 +436,67 @@ describe('entity_id scoping by file origin', () => {
       files: [{ file_id: 'f1', filename: 'a.txt', fromAgent: true }],
     });
     await tool.func({ query: 'q' });
+    expect(batchBodiesSent()).toEqual([]);
     expect(bodiesSent()[0].entity_id).toBeUndefined();
+  });
+
+  it('takes each namespace hit fileId from the chunk metadata', async () => {
+    axios.post.mockResolvedValue({
+      data: [
+        [{ page_content: 'closer match', metadata: { source: '/kb2.pdf', file_id: 'kb-2' } }, 0.1],
+        [{ page_content: 'farther match', metadata: { source: '/kb1.pdf', file_id: 'kb-1' } }, 0.2],
+      ],
+    });
+    const tool = await createFileSearchTool({
+      userId: 'user1',
+      entity_id: 'agent_123',
+      files: [{ file_id: 'kb-1', filename: 'kb1.pdf', fromAgent: true }],
+    });
+
+    const [, artifact] = await tool.func({ query: 'q' });
+
+    expect(artifact.file_search.sources[0].fileId).toBe('kb-2');
+    expect(artifact.file_search.sources[1].fileId).toBe('kb-1');
+  });
+
+  it('reads a namespace 404 as no matches rather than a failed search', async () => {
+    axios.post.mockRejectedValue({ response: { status: 404 } });
+    const tool = await createFileSearchTool({
+      userId: 'user1',
+      entity_id: 'agent_123',
+      files: [{ file_id: 'kb-1', filename: 'kb.pdf', fromAgent: true }],
+    });
+
+    const [content] = await tool.func({ query: 'q' });
+
+    expect(content).toBe(
+      'No content found in the files. The files may not have been processed correctly or you may need to refine your query.',
+    );
+  });
+
+  it('keeps user-attachment results when the namespace query fails', async () => {
+    axios.post.mockImplementation(async (url) => {
+      if (String(url).endsWith('/query_multiple')) {
+        throw new Error('namespace unavailable');
+      }
+      return {
+        data: [[{ page_content: 'attachment passage', metadata: { source: '/att.txt' } }, 0.2]],
+      };
+    });
+    const tool = await createFileSearchTool({
+      userId: 'user1',
+      entity_id: 'agent_123',
+      files: [
+        { file_id: 'kb-1', filename: 'kb.pdf', fromAgent: true },
+        { file_id: 'user-1', filename: 'att.txt', fromAgent: false },
+      ],
+    });
+
+    const [content, artifact] = await tool.func({ query: 'q' });
+
+    expect(content).toContain('attachment passage');
+    expect(artifact.file_search.sources).toHaveLength(1);
+    expect(artifact.file_search.sources[0].fileId).toBe('user-1');
   });
 });
 
