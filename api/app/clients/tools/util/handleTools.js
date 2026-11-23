@@ -121,6 +121,69 @@ const getAuthFields = (toolKey) => {
   return manifestToolMap[toolKey]?.authConfig.map((auth) => auth.authField) ?? [];
 };
 
+// ---------------------------------------------------------------------------
+// Raw-name MCP fallback.
+//
+// The model-facing name of an MCP tool is the FULL tool key
+// `${toolName}${Constants.mcp_delimiter}${serverName}`: MCP.js's
+// createToolInstance names the instance that way, so that string is both the
+// function name in the model's tool schema and the key the ON_TOOL_EXECUTE
+// handler's toolMap resolves calls by. Models still emit RAW upstream tool
+// names — persona prompts name tools in prose ("read_document for everything
+// else"), and models abbreviate schema names. A raw-name call matches nothing
+// here (mcpToolPattern only matches full keys), the batch loads nothing, and
+// the run answers `Tool "x" not found. Available: ` with an EMPTY list — the
+// model cannot self-correct and the tool stays unreachable even though the
+// agent has it. Seen live 2026-11-23 on the librechat-demo deployment
+// (v0.8.8): the Quail agent's prompt says read_document; the call failed
+// while read_document_mcp_quail-site-tools sat unused in agent.tools.
+//
+// FIX: when a called name is not itself an MCP key, not a host/built-in tool
+// name, and extends to EXACTLY ONE MCP tool key in the agent's tool list
+// (`<name><delimiter><server>`), route the call through that key — the normal
+// MCP branch loads it — and expose an alias view named as the model called it
+// (after the MCP instances load), so the handler's toolMap resolves the raw
+// name too. Ambiguous names (the same tool name on 2+ attached servers) are
+// left alone: they fail with the existing not-found error rather than
+// guessing a server.
+// ---------------------------------------------------------------------------
+
+/**
+ * Map raw tool names to the unique full MCP tool key in `agentTools` they
+ * extend. Names that are themselves MCP keys or appear in `reservedNames`
+ * (host/built-in tools) never map.
+ *
+ * @param {Array<string>} requested
+ * @param {Array<string>} [agentTools]
+ * @param {Iterable<string>} [reservedNames]
+ * @returns {Map<string, string>}
+ */
+const buildRawMCPAliases = (requested, agentTools, reservedNames = []) => {
+  const aliases = new Map();
+  if (!agentTools?.length || !requested?.length) {
+    return aliases;
+  }
+  const delimiter = Constants.mcp_delimiter;
+  const reserved = new Set(reservedNames);
+  for (const name of requested) {
+    if (!name || aliases.has(name) || reserved.has(name) || mcpToolPattern.test(name)) {
+      continue;
+    }
+    const prefix = `${name}${delimiter}`;
+    const matches = agentTools.filter(
+      (candidate) => typeof candidate === 'string' && candidate.startsWith(prefix),
+    );
+    if (matches.length === 1) {
+      aliases.set(name, matches[0]);
+    } else if (matches.length > 1) {
+      logger.warn(
+        `[handleTools] Raw MCP tool call "${name}" matches ${matches.length} agent tools (${matches.join(', ')}); leaving it unresolved.`,
+      );
+    }
+  }
+  return aliases;
+};
+
 /**
  *
  * @param {object} params
@@ -218,7 +281,23 @@ const loadTools = async ({
   };
 
   const requestedTools = {};
-  const hasMCPTools = tools.some((toolName) => toolName && mcpToolPattern.test(toolName));
+  // Raw-name MCP fallback: resolve called raw tool names to the agent's full
+  // MCP tool keys BEFORE the hasMCPTools check, so a batch carrying only raw
+  // names still counts as MCP (server context, collision audit, and the MCP
+  // permission gate all apply to it).
+  const rawMCPAliases = buildRawMCPAliases(tools, agent?.tools, [
+    ...Object.values(Tools),
+    ...Object.keys(toolConstructors),
+    ...Object.keys(customConstructors),
+    ...Object.keys(toolkitParent),
+    ...Object.keys(toolRolePermissions),
+    ASK_USER_QUESTION_TOOL_NAME,
+    SET_MEMORY_TOOL_NAME,
+    DELETE_MEMORY_TOOL_NAME,
+  ]);
+  const hasMCPTools = tools.some(
+    (toolName) => toolName && (mcpToolPattern.test(toolName) || rawMCPAliases.has(toolName)),
+  );
   const mcpPermissionContext =
     options.mcpPermissionContext ?? createMCPPermissionContext(options.req);
   const canUseMCP = hasMCPTools
@@ -303,7 +382,18 @@ const loadTools = async ({
   const serverNameAliases = buildServerNameAliases(collisionAudit.names);
   const shadowedServers = findShadowedServerNames(collisionAudit.names);
 
-  for (const tool of tools) {
+  for (let tool of tools) {
+    // Raw-name MCP fallback: a raw tool name that extends to exactly one
+    // agent MCP tool key is routed through that key by the normal MCP branch
+    // below; `let` above makes the rewrite possible. The role gate that
+    // follows still sees the resolved key.
+    const rawAliasKey = rawMCPAliases.get(tool);
+    if (rawAliasKey) {
+      logger.info(
+        `[handleTools] Raw MCP tool call "${tool}" resolved to agent tool key "${rawAliasKey}"`,
+      );
+      tool = rawAliasKey;
+    }
     /** `loadTools` is the shared boundary for every runtime that equips these
      *  tools — agents, and the Assistants required-action flow via
      *  `processRequiredActions`, which never passes through the agent capability
@@ -540,12 +630,16 @@ const loadTools = async ({
       }
 
       requestedMCPTools[serverName] = requestedMCPTools[serverName] || [];
-      requestedMCPTools[serverName].push({
-        type: 'single',
-        toolKey: tool,
-        serverName,
-        config: serverConfig,
-      });
+      // Raw-name MCP fallback: a batch may carry the same tool twice (the raw
+      // name and its full key) — dedupe so loadMCPTools creates the tool once.
+      if (!requestedMCPTools[serverName].some((entry) => entry.toolKey === tool)) {
+        requestedMCPTools[serverName].push({
+          type: 'single',
+          toolKey: tool,
+          serverName,
+          config: serverConfig,
+        });
+      }
       continue;
     }
 
@@ -664,6 +758,29 @@ const loadTools = async ({
       },
     })),
   );
+  // Raw-name MCP fallback: expose each resolved raw name as an alias view of
+  // the loaded MCP tool. The ON_TOOL_EXECUTE handler keys its toolMap by
+  // instance `.name` and looks calls up by the name the model emitted, so
+  // without this the raw-name call still fails with `Tool "x" not found`.
+  // The view shares the instance through the prototype chain (_call, schema,
+  // mcp* metadata) and only shadows `.name`; the MCP tool's `_call` is a
+  // closure over captured constants and never reads `this`, so execution is
+  // unaffected by the shadowed name.
+  if (rawMCPAliases.size > 0) {
+    const loadedByName = new Map(loadedTools.map((instance) => [instance.name, instance]));
+    for (const [rawName, toolKey] of rawMCPAliases) {
+      const instance = loadedByName.get(toolKey);
+      if (!instance) {
+        logger.warn(
+          `[handleTools] Raw MCP alias "${rawName}" -> "${toolKey}" did not load; the call will fail with tool-not-found.`,
+        );
+        continue;
+      }
+      const aliasView = Object.create(instance);
+      aliasView.name = rawName;
+      loadedTools.push(aliasView);
+    }
+  }
   return { loadedTools, toolContextMap, dynamicToolContextMap, primedCodeFiles };
 };
 
