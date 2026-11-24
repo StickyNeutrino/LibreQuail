@@ -46,14 +46,73 @@ interface SearchOptions {
   logger: Pick<typeof logger, 'debug'>;
 }
 
-/** How many chunks one namespace-wide query returns. The tool call keeps the top 10
- * chunks overall, and a single scoped query returns that set directly: the old
- * per-file fan-out (5 per file, merged) picked the same chunks at one request
- * per knowledge-base file. */
-const NAMESPACE_QUERY_K = 10;
+/** Chunks one namespace-wide query fetches. Deliberately deeper than the
+ * RESULT_LIMIT: selection spends the pool breadth-first across documents and
+ * then depth-first within them (see selectHits), and per-document depth past
+ * each document's opening chunk only exists in the pool if the query fetched
+ * it. The old per-file fan-out (5 per file, merged) implicitly had this depth;
+ * a k=10 namespace query would not. */
+const NAMESPACE_QUERY_K = 100;
+
+/** How many chunks one tool call returns (upstream contract: the client and
+ * the citation instructions both assume the top 10). */
+const RESULT_LIMIT = 10;
+
+/** Distinct documents one result set may span before the remaining slots go to
+ * more chunks of the documents already selected. Caps sibling-document flooding:
+ * corpora hold families of similar documents (one committee's agendas, minutes,
+ * reports) whose opening chunks all carry the family's title, so for a title-shaped
+ * query every sibling's opening outranks every body chunk and a flat top-10 comes
+ * back as one opening per sibling — headers, no content. */
+const MAX_FILES = 6;
+
+/** Chunks kept per document while breadth is still available: the opening chunk
+ * plus the first body chunk, so each selected document contributes content and
+ * not just its header. */
+const MAX_PER_FILE = 2;
 
 /** One search hit with the file it came from, ready for ranking. */
 type RankedHit = { hit: SearchHit; distance: number; file_id: string };
+
+/** Selects which hits a search returns. Breadth first — up to MAX_PER_FILE chunks
+ * from each of the MAX_FILES best-matching documents (documents ordered by their
+ * best chunk, chunks within a document by distance) — then a distance-order top-up
+ * over the whole pool when breadth and depth together fall short of RESULT_LIMIT.
+ * The top-up restores the flat top-10 exactly when it was never the problem: few
+ * documents matched, or one document holds all the relevance (its deep chunks fill
+ * the remaining slots in distance order). Display order is the selection order, so
+ * each document's chunks appear together. */
+function selectHits(pool: RankedHit[]): RankedHit[] {
+  const byFile = new Map<string, RankedHit[]>();
+  for (const entry of pool) {
+    const fileHits = byFile.get(entry.file_id);
+    if (fileHits) {
+      fileHits.push(entry);
+    } else {
+      byFile.set(entry.file_id, [entry]);
+    }
+  }
+  const fileOrder = [...byFile.values()].sort((a, b) => a[0].distance - b[0].distance);
+  const selected: RankedHit[] = [];
+  const kept = new Set<RankedHit>();
+  for (const fileHits of fileOrder.slice(0, MAX_FILES)) {
+    for (const entry of fileHits.slice(0, MAX_PER_FILE)) {
+      if (selected.length >= RESULT_LIMIT) break;
+      selected.push(entry);
+      kept.add(entry);
+    }
+    if (selected.length >= RESULT_LIMIT) break;
+  }
+  for (const entry of pool) {
+    if (selected.length >= RESULT_LIMIT) break;
+    if (kept.has(entry)) {
+      continue;
+    }
+    selected.push(entry);
+    kept.add(entry);
+  }
+  return selected;
+}
 
 /** Executes a file-search tool call without sending malformed queries to RAG API. */
 export async function executeFileSearchQuery({
@@ -167,11 +226,8 @@ export async function executeFileSearchQuery({
     return ['No results found or errors occurred while searching the files.', undefined];
   }
 
-  const formattedResults = succeeded
-    .flat()
-    .sort((a, b) => a.distance - b.distance)
-    .slice(0, 10)
-    .map((entry) => ({
+  const formattedResults = selectHits(succeeded.flat().sort((a, b) => a.distance - b.distance)).map(
+    (entry) => ({
       filename: entry.hit.metadata.source.split('/').pop(),
       content: entry.hit.page_content,
       distance: entry.distance,
@@ -182,7 +238,8 @@ export async function executeFileSearchQuery({
         entry.hit.metadata.page >= 0
           ? entry.hit.metadata.page + 1
           : null,
-    }));
+    }),
+  );
 
   if (formattedResults.length === 0) {
     return [

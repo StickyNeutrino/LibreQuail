@@ -400,8 +400,10 @@ describe('entity_id scoping by file origin', () => {
 
     // The agent's files share one namespace, so one scoped request covers them all;
     // the user attachment is not part of that namespace and keeps its own request.
+    // k mirrors NAMESPACE_QUERY_K — deeper than the 10-result limit so selection
+    // can spend the pool breadth-first across documents, then depth-first within them.
     expect(batchBodiesSent()).toEqual([
-      { query: 'q', file_ids: ['kb-1', 'kb-2'], k: 10, entity_id: 'agent_123' },
+      { query: 'q', file_ids: ['kb-1', 'kb-2'], k: 100, entity_id: 'agent_123' },
     ]);
     expect(bodiesSent()).toEqual([{ file_id: 'user-1', query: 'q', k: 5 }]);
   });
@@ -497,6 +499,125 @@ describe('entity_id scoping by file origin', () => {
     expect(content).toContain('attachment passage');
     expect(artifact.file_search.sources).toHaveLength(1);
     expect(artifact.file_search.sources[0].fileId).toBe('user-1');
+  });
+});
+
+describe('fileSearch.js - result selection (breadth + depth)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.RAG_API_URL = 'http://localhost:8000';
+    generateShortLivedToken.mockReturnValue('mock-jwt-token');
+  });
+
+  const kbFile = (id) => ({ file_id: id, filename: `${id}.txt`, fromAgent: true });
+
+  it('caps sibling-document openings so body chunks make the top 10', async () => {
+    // A corpus of sibling documents (one committee's agendas and minutes) all
+    // carry the family title in their opening chunk: a flat top-10 would return
+    // ten openings and no content, which is how the 2026-11-24 "Tecolote Canyon
+    // Committee Overview" chat ended up answering from web search.
+    const data = [];
+    const files = [];
+    for (let f = 0; f < 10; f++) {
+      files.push(kbFile(`doc-${f}`));
+      data.push([
+        {
+          page_content: `doc ${f} opening`,
+          metadata: { source: `/doc-${f}.txt`, file_id: `doc-${f}` },
+        },
+        0.01 + f * 0.001,
+      ]);
+      for (let c = 1; c <= 4; c++) {
+        data.push([
+          {
+            page_content: `doc ${f} body chunk ${c}`,
+            metadata: { source: `/doc-${f}.txt`, file_id: `doc-${f}` },
+          },
+          0.1 + f * 0.001 + c * 0.01,
+        ]);
+      }
+    }
+    axios.post.mockResolvedValue({ data });
+
+    const tool = await createFileSearchTool({
+      userId: 'user1',
+      entity_id: 'agent_123',
+      files,
+    });
+    const [content, artifact] = await tool.func({ query: 'the committee' });
+
+    const sources = artifact.file_search.sources;
+    expect(sources).toHaveLength(10);
+    // At most MAX_FILES documents, and no document contributes more than its
+    // opening plus its first body chunk — deeper chunks wait for a follow-up
+    // search or a full-document read instead of being crowded out entirely.
+    const counts = {};
+    for (const source of sources) {
+      counts[source.fileId] = (counts[source.fileId] ?? 0) + 1;
+    }
+    expect(Object.keys(counts).length).toBeLessThanOrEqual(6);
+    expect(Object.values(counts).every((n) => n <= 2)).toBe(true);
+    // Body content is in the result set, not just openings.
+    expect(content).toContain('doc 0 body chunk 1');
+    expect(content).toContain('doc 4 body chunk 1');
+    expect(content).not.toContain('body chunk 2');
+    // Display order groups each document's chunks together (opening first).
+    expect(sources[0].content).toBe('doc 0 opening');
+    expect(sources[1].content).toBe('doc 0 body chunk 1');
+    expect(sources[2].content).toBe('doc 1 opening');
+  });
+
+  it('keeps the flat top-10 when one document holds all the relevance', async () => {
+    const data = [];
+    for (let c = 0; c < 12; c++) {
+      data.push([
+        { page_content: `chunk ${c}`, metadata: { source: '/single.txt', file_id: 'single' } },
+        0.1 + c * 0.01,
+      ]);
+    }
+    axios.post.mockResolvedValue({ data });
+
+    const tool = await createFileSearchTool({
+      userId: 'user1',
+      entity_id: 'agent_123',
+      files: [kbFile('single')],
+    });
+    const [content, artifact] = await tool.func({ query: 'specific detail' });
+
+    expect(artifact.file_search.sources).toHaveLength(10);
+    expect(content).toContain('chunk 9');
+    expect(content).not.toContain('chunk 10');
+    // Distance order is preserved: the top-up fills the slots the breadth pass
+    // left open with the pool's next-best chunks.
+    const contentOrder = artifact.file_search.sources.map((s) => s.content);
+    expect(contentOrder).toEqual(Array.from({ length: 10 }, (_, c) => `chunk ${c}`));
+  });
+
+  it('returns every hit when the pool is smaller than the result limit', async () => {
+    const data = [];
+    for (const fileId of ['a', 'b']) {
+      for (let c = 0; c < 3; c++) {
+        data.push([
+          {
+            page_content: `${fileId} chunk ${c}`,
+            metadata: { source: `/${fileId}.txt`, file_id: fileId },
+          },
+          0.1 + (fileId === 'b' ? 0.05 : 0) + c * 0.01,
+        ]);
+      }
+    }
+    axios.post.mockResolvedValue({ data });
+
+    const tool = await createFileSearchTool({
+      userId: 'user1',
+      entity_id: 'agent_123',
+      files: [kbFile('a'), kbFile('b')],
+    });
+    const [content, artifact] = await tool.func({ query: 'q' });
+
+    expect(artifact.file_search.sources).toHaveLength(6);
+    expect(content).toContain('a chunk 2');
+    expect(content).toContain('b chunk 2');
   });
 });
 
